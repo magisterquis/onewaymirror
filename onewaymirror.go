@@ -3,13 +3,18 @@
 // back, logging the whole session in the process.
 package main
 
+/* TODO: Test both sides closing connection */
+
 import (
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"path"
 	"strings"
+	"time"
 )
 
 /*
@@ -19,11 +24,15 @@ import (
  * last modified 20140428
  */
 
+/* TODO: Have one conn ending close the other conn */
+
 func main() {
 	/* Parse options */
-	listenAddr := flag.String("addr", ":23", "[Address and] port on which to listen.")
-	//logDir := flag.String("logdir", "onewaymirror", "Directory to which to write logs.")
-	//enableLogging := flag.Bool("nolog", false, "Disable session logging.")
+	listenAddr := flag.String("addr", ":23", "[Address and] port on "+
+		"which to listen.")
+	logDir := flag.String("logdir", "onewaymirror", "Directory to which "+
+		"to write logs.")
+	disableLogging := flag.Bool("nolog", false, "Disable session logging.")
 	disable4 := flag.Bool("no4", false, "Disable IPv4.")
 	disable6 := flag.Bool("no6", false, "Disable IPv6.")
 	banner := flag.String("banner", "Connection proxied by onewaymirror.",
@@ -36,9 +45,14 @@ func main() {
 
 	/* Make sure logdir exists */
 	/* TODO: unhardcode the perms */
-	//if err := os.MkdirAll(*logDir, 0755); err != nil {
-	//	log.Fatalf("Unable to create directory %v: %v", *logDir, err)
-	//}
+	if !*disableLogging {
+		if err := os.MkdirAll(*logDir, 0755); err != nil {
+			log.Fatalf("Unable to create directory %v: %v",
+				*logDir, err)
+		}
+	} else {
+		logDir = nil
+	}
 
 	/* Channels on which to receive connections */
 	var ch4, ch6 chan *net.TCPConn
@@ -85,9 +99,9 @@ func main() {
 	for {
 		select {
 		case c := <-ch4:
-			go handleConn(c, *buflen, *banner)
+			go handleConn(c, *buflen, *banner, logDir)
 		case c := <-ch6:
-			go handleConn(c, *buflen, *banner)
+			go handleConn(c, *buflen, *banner, logDir)
 		case <-allDead:
 			log.Fatalf("All listeners have terminated")
 		}
@@ -99,8 +113,9 @@ func main() {
 
 /* Goroutine to handle incoming connection */
 /* handleConn handles incoming connections using a buffer of buflen bytes and
-sending banner to each incoming connection if banner is not the empty string */
-func handleConn(r *net.TCPConn, buflen int, banner string) {
+sending banner to each incoming connection if banner is not the empty string.
+Sessions will be logged in logdir. */
+func handleConn(r *net.TCPConn, buflen int, banner string, logdir *string) {
 	defer r.Close()
 	constr := fmt.Sprintf("%v -> %v", r.RemoteAddr(), r.LocalAddr())
 	log.Printf("Connection got: %v", constr)
@@ -141,9 +156,9 @@ func handleConn(r *net.TCPConn, buflen int, banner string) {
 	/* Try to connect right back */
 	t, err := net.DialTCP("tcp", nil, ta)
 	if err != nil {
-		e := fmt.Sprintf("Unable to connect back to %v\n", ta)
+		e := fmt.Sprintf("Unable to connect back to %v", ta)
 		log.Printf("%v: %v", e, err)
-		if _, err := r.Write([]byte(e)); err != nil {
+		if _, err := r.Write([]byte(e+"\n")); err != nil {
 			log.Printf("Unable to tell %v a connection can't be "+
 				"established to %v: %v", rad, ta, err)
 		}
@@ -153,10 +168,22 @@ func handleConn(r *net.TCPConn, buflen int, banner string) {
 	tgtstr := fmt.Sprintf("%v -> %v", t.LocalAddr(), t.RemoteAddr())
 	log.Printf("Connection made: %v", tgtstr)
 
+	/* Per-session Logging */
+	var in chan packet
+	var out chan packet
+	if logdir != nil {
+		in = make(chan packet)
+		out = make(chan packet)
+		defer close(in)
+		defer close(out)
+		go logSession(in, out, path.Join(*logdir, ta.IP.String()),
+			time.Now().Format(time.RFC3339Nano))
+	}
+
 	/* Proxy bytes */
 	done := make(chan *net.TCPConn)
-	go proxyBytes(r, t, done, buflen, constr)
-	go proxyBytes(t, r, done, buflen, tgtstr)
+	go proxyBytes(r, t, done, buflen, constr, in)
+	go proxyBytes(t, r, done, buflen, tgtstr, out)
 
 	/* Close both sides when one closes */
 	<-done
@@ -209,7 +236,7 @@ func waitDead(n int, in, out chan int) {
 it sends an int to done when it's done.  cstr describes the connection as
 a string */
 func proxyBytes(src, dst *net.TCPConn, done chan *net.TCPConn, buflen int,
-	cstr string) {
+	cstr string, logc chan packet) {
 	buf := make([]byte, buflen)
 	read := 0
 	written := 0
@@ -248,7 +275,10 @@ func proxyBytes(src, dst *net.TCPConn, done chan *net.TCPConn, buflen int,
 				break
 			}
 		}
-		/* TODO: Logging here */
+		/* Log the incoming data */
+		if logc != nil {
+			logc <- packet{buf, n}
+		}
 		/* Write until it's done or an error happens */
 		start := 0
 		end := n
@@ -269,3 +299,98 @@ func proxyBytes(src, dst *net.TCPConn, done chan *net.TCPConn, buflen int,
 		}
 	}
 }
+
+/* logSession waits for packets on p and writes them to two files starting with
+the prefix prefix, which should be a path.  The files will be a .log containig
+a textual representation of the session, and a .owm, which will be
+replayable */
+func logSession(in, out chan packet, dir, prefix string) {
+	/* Open files */
+	// tlog := openLogFile(prefix + ".log")
+	/* TODO: text log */
+	olog := openLogFile(dir, prefix+".owm")
+	defer olog.Close()
+	/* If the channels are closed */
+	var iclosed, oclosed bool
+	/* Wait for input */
+	for {
+		/* Die if both channels are closed */
+		if iclosed && oclosed {
+			break
+		}
+		/* Get some bytes to log */
+		select {
+		case p, ok := <-in:
+			if !ok {
+				iclosed = true
+				continue
+			}
+			t := time.Now()
+			logPacket(olog, p, true, t)
+		case p, ok := <-out:
+			if !ok {
+				oclosed = true
+				continue
+			}
+			t := time.Now()
+			logPacket(olog, p, false, t)
+		}
+	}
+}
+
+/* openLogFile opens a log file or prints an error and returns nil */
+func openLogFile(dir, name string) *os.File {
+	/* TODO: Unhardcode modes */
+	/* Make sure directory exists */
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Fatalf("Unable to create directory %v: %v", dir, err)
+		return nil
+	}
+
+	f, err := os.OpenFile(path.Join(dir, name),
+		os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		log.Printf("Unable to open %v: %v", name, err)
+		return nil
+	}
+	return f
+}
+
+/* packet represents a packet */
+type packet struct {
+	data   []byte
+	length int
+}
+
+/* logPacket writes a packet p to the (.owm) logfile f, tagged with direction
+d (true: in, false: out) at time t.  If f is nil, logPacket returns
+immediately */
+func logPacket(f *os.File, p packet, d bool, t time.Time) {
+	if f == nil {
+		return
+	}
+	/* Direction as a rune */
+	var dc rune
+	if d {
+		dc = 'i'
+	} else {
+		dc = 'o'
+	}
+	/* Metadata */
+	/* timestamp\tseconds.nanoseconds\tdirection\tdatalen\tdata */
+	s := fmt.Sprintf("\n%v\t%v.%v\t%c\t%v\t", t.Format(time.StampNano),
+		t.Unix(), t.Nanosecond(), dc, p.length)
+	if n, err := f.Write([]byte(s)); err != nil {
+		log.Printf("Only wrote %v/%v bytes of metadata to %v: %v", n,
+			len(s), f.Name(), err)
+		f.Close()
+	}
+	/* Payload */
+	if n, err := f.Write(p.data[0:p.length]); err != nil {
+		log.Printf("Only wrote %v/%v bytes of payload data to %v: %v",
+			n, p.length, f.Name(), err)
+		f.Close()
+	}
+}
+
+/* Can make a connection, but breaking connections don't seem to do anything.  Also, nothing gets logged, but the file gets made */
